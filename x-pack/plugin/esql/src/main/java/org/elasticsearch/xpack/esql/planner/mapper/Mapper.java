@@ -11,6 +11,8 @@ import org.elasticsearch.compute.aggregation.AggregatorMode;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
+import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.grouping.GroupingFunction;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
@@ -30,9 +32,11 @@ import org.elasticsearch.xpack.esql.plan.logical.TopN;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
 import org.elasticsearch.xpack.esql.plan.logical.TsInfo;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
+import org.elasticsearch.xpack.esql.plan.logical.join.EqJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.Join;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinConfig;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
+import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.HashJoinExec;
@@ -43,6 +47,7 @@ import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.MergeExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNByExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.plan.physical.TsInfoExec;
@@ -60,6 +65,8 @@ import java.util.List;
  * instances, which represent data being sent back from the data nodes to the coordinating node.</p>
  */
 public class Mapper {
+
+    public static final String LOOKUP_TABLE_ORDINAL_ATTRIBUTE = "$$lookup_table_key_ordinal";
 
     public PhysicalPlan map(Versioned<LogicalPlan> versionedPlan) {
         // We ignore the version for now, but it's fine to use later for plans that work
@@ -202,6 +209,31 @@ public class Mapper {
     }
 
     private PhysicalPlan mapBinary(BinaryPlan bp) {
+        if (bp instanceof EqJoin eqJoin) {
+            PhysicalPlan left = mapInner(bp.left());
+            PhysicalPlan right = mapInner(bp.right());
+            if (right instanceof LocalSourceExec localData) {
+                // Always add the lookup ordinal (bound to RowInTableLookup positions); Project drops it.
+                // Unique joins wrap DistinctBy(lookupOrdinalKey) before Project.
+                var lookupOrdinalKey = new ReferenceAttribute(eqJoin.source(), null, LOOKUP_TABLE_ORDINAL_ATTRIBUTE, DataType.INTEGER);
+                List<Attribute> addedFields = new ArrayList<>(eqJoin.addedFields());
+                addedFields.add(lookupOrdinalKey);
+                PhysicalPlan join = new HashJoinExec(
+                    eqJoin.source(),
+                    left,
+                    localData,
+                    eqJoin.leftFields(),
+                    eqJoin.rightFields(),
+                    addedFields,
+                    JoinTypes.INNER
+                );
+                if (eqJoin.unique()) {
+                    join = new DistinctByExec(eqJoin.source(), join, lookupOrdinalKey, true);
+                }
+                return new ProjectExec(eqJoin.source(), join, eqJoin.output());
+            }
+            return MapperUtils.unsupported(bp);
+        }
         if (bp instanceof Join join) {
             JoinConfig config = join.config();
             if (config.type() != JoinTypes.LEFT) {
