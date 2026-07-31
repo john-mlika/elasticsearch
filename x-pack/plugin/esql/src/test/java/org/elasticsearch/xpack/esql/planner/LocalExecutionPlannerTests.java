@@ -89,6 +89,7 @@ import org.elasticsearch.xpack.esql.datasources.spi.StoragePath;
 import org.elasticsearch.xpack.esql.expression.Order;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.Count;
 import org.elasticsearch.xpack.esql.index.EsIndexGenerator;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.ProjectAwayColumns;
 import org.elasticsearch.xpack.esql.plan.QuerySettings;
 import org.elasticsearch.xpack.esql.plan.ResolvedSettings;
@@ -122,7 +123,7 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.LOOKUP_TABLE_ORDINAL_ATTRIBUTE;
+import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -1049,7 +1050,12 @@ public class LocalExecutionPlannerTests extends MapperServiceTestCase {
         List<Attribute> buildKeyAttrs,
         List<Attribute> buildValueAttrs
     ) {
-        ReferenceAttribute matchOrdinal = new ReferenceAttribute(Source.EMPTY, null, LOOKUP_TABLE_ORDINAL_ATTRIBUTE, DataType.INTEGER);
+        ReferenceAttribute matchOrdinal = new ReferenceAttribute(
+            Source.EMPTY,
+            null,
+            TemporaryNameGenerator.locallyUniqueTemporaryName(INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX),
+            DataType.INTEGER
+        );
         List<Attribute> addedFields = new ArrayList<>(buildValueAttrs);
         addedFields.add(matchOrdinal);
         PhysicalPlan join = new HashJoinExec(Source.EMPTY, probe, build, probeKeyAttrs, buildKeyAttrs, addedFields, JoinTypes.INNER);

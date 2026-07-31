@@ -29,10 +29,12 @@ import org.elasticsearch.xpack.esql.session.Versioned;
 import java.util.List;
 
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.as;
+import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.sameInstance;
+import static org.hamcrest.Matchers.startsWith;
 
 public class EqJoinMapperTests extends ESTestCase {
 
@@ -45,6 +47,7 @@ public class EqJoinMapperTests extends ESTestCase {
 
         DistinctByExec distinctBy = as(project.child(), DistinctByExec.class);
         assertThat(distinctBy.failOnDuplicate(), equalTo(true));
+        assertThat(distinctBy.key().name(), startsWith(Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX + INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX));
 
         HashJoinExec join = as(distinctBy.child(), HashJoinExec.class);
         assertThat(join.joinType(), equalTo(JoinTypes.INNER));

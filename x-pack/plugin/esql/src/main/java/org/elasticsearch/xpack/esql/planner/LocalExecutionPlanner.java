@@ -236,7 +236,8 @@ import java.util.stream.Stream;
 import static java.util.Arrays.asList;
 import static java.util.stream.Collectors.joining;
 import static org.elasticsearch.compute.operator.ProjectOperator.ProjectOperatorFactory;
-import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.LOOKUP_TABLE_ORDINAL_ATTRIBUTE;
+import static org.elasticsearch.xpack.esql.core.expression.Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX;
+import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX;
 import static org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter.stringToInt;
 
 /**
@@ -1422,7 +1423,9 @@ public class LocalExecutionPlanner {
         // added fields not on the build side appends after the probe layout
         Attribute lookupOrdinalKeyField = null;
         for (var f : join.addedFields()) {
-            if (LOOKUP_TABLE_ORDINAL_ATTRIBUTE.equals(f.name()) && localSourceExec.outputSet().contains(f) == false) {
+            if (f.name() != null
+                && f.name().startsWith(SYNTHETIC_ATTRIBUTE_NAME_PREFIX + INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX)
+                && localSourceExec.outputSet().contains(f) == false) {
                 lookupOrdinalKeyField = f;
                 break;
             }

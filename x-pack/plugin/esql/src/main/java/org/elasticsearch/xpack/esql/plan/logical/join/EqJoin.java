@@ -24,11 +24,12 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
+import static java.util.function.Predicate.not;
+import static java.util.stream.Stream.concat;
 import static org.elasticsearch.xpack.esql.expression.NamedExpressions.mergeOutputAttributes;
 
 /**
- * Join where the right side is first collected on the coordinator and turned into a lookup table keyed by selected fields.
- * The left side then streams through, and each row is matched by key equality against this lookup, producing output only for matches.
+ * Specialized type of join that matches rows with identical values in the specified columns.
  */
 public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinator {
 
@@ -79,20 +80,14 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
     @Override
     public List<Attribute> output() {
         if (lazyOutput == null) {
-            List<Attribute> leftOutputWithoutKeys = left().output().stream().filter(attr -> leftFields().contains(attr) == false).toList();
-            List<Attribute> rightWithAppendedKeys = new ArrayList<>(right().output());
-            rightWithAppendedKeys.removeAll(rightFields());
-            rightWithAppendedKeys.addAll(leftFields());
-            lazyOutput = mergeOutputAttributes(rightWithAppendedKeys, leftOutputWithoutKeys);
+            lazyOutput = mergeOutputAttributes(
+                concat(right().output().stream().filter(not(rightFields()::contains)), leftFields().stream()).toList(),
+                left().output().stream().filter(not(leftFields()::contains)).toList()
+            );
         }
         return lazyOutput;
     }
 
-    /**
-     * {@link Join#computeOutputExpressions(List, List)} throws for non-LEFT join types, so INNER computes its own output (mirroring
-     * {@link #output()}). Mapper maps this to {@code HashJoinExec} plus an optional {@code DistinctByExec} and a final
-     * {@code ProjectExec} that drops the synthetic lookup ordinal.
-     */
     @Override
     public List<NamedExpression> computeOutputExpressions(List<? extends NamedExpression> left, List<? extends NamedExpression> right) {
         return new ArrayList<>(output());
@@ -107,22 +102,22 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
      * Finds the first (bottom-up) {@link EqJoin} whose right subquery has not yet been replaced with results.
      */
     public static LogicalPlanTuple firstSubPlan(LogicalPlan optimizedPlan, Set<LocalRelation> subPlansResults) {
-        Holder<LogicalPlan> subPlanHolder = new Holder<>();
+        var subPlanHolder = new Holder<LogicalPlan>();
         optimizedPlan.forEachUp(EqJoin.class, join -> {
             if (subPlanHolder.get() == null) {
-                if (join.right() instanceof LocalRelation lr && subPlansResults.contains(lr)) {
-                    return;
+                if ((join.right() instanceof LocalRelation lr && subPlansResults.contains(lr)) == false) {
+                    subPlanHolder.set(join.right());
                 }
-                subPlanHolder.set(join.right());
             }
         });
-        LogicalPlan subPlan = subPlanHolder.get();
+
+        var subPlan = subPlanHolder.get();
         if (subPlan == null) {
             return null;
         }
         subPlan.setOptimized();
-        // The subplan is the very same instance held on the join's right side, so it doubles as the identity key used to substitute the
-        // materialized result back into the main plan - hence both tuple slots are the same.
+        // same instance held on the join's right side, so it doubles as the identity key used to substitute the
+        // materialized result back into the main plan hence both tuple slots are the same.
         return new LogicalPlanTuple(subPlan, subPlan);
     }
 

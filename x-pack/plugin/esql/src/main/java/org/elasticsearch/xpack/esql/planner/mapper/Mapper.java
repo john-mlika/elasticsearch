@@ -14,6 +14,7 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.grouping.GroupingFunction;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Enrich;
@@ -66,7 +67,7 @@ import java.util.List;
  */
 public class Mapper {
 
-    public static final String LOOKUP_TABLE_ORDINAL_ATTRIBUTE = "$$lookup_table_key_ordinal";
+    public static final String INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX = "joined_on_key_ordinal";
 
     public PhysicalPlan map(Versioned<LogicalPlan> versionedPlan) {
         // We ignore the version for now, but it's fine to use later for plans that work
@@ -213,11 +214,16 @@ public class Mapper {
             PhysicalPlan left = mapInner(bp.left());
             PhysicalPlan right = mapInner(bp.right());
             if (right instanceof LocalSourceExec localData) {
-                // Always add the lookup ordinal (bound to RowInTableLookup positions); Project drops it.
-                // Unique joins wrap DistinctBy(lookupOrdinalKey) before Project.
-                var lookupOrdinalKey = new ReferenceAttribute(eqJoin.source(), null, LOOKUP_TABLE_ORDINAL_ATTRIBUTE, DataType.INTEGER);
-                List<Attribute> addedFields = new ArrayList<>(eqJoin.addedFields());
-                addedFields.add(lookupOrdinalKey);
+                // add ordinal to lookup table position (i.e. what position matched from the right)
+                // used by subsequent DistinctBy for one-to-one joins
+                var sentinel = new ReferenceAttribute(
+                    eqJoin.source(),
+                    null,
+                    TemporaryNameGenerator.locallyUniqueTemporaryName(INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX),
+                    DataType.INTEGER
+                );
+                var addedFields = new ArrayList<>(eqJoin.addedFields());
+                addedFields.add(sentinel);
                 PhysicalPlan join = new HashJoinExec(
                     eqJoin.source(),
                     left,
@@ -228,7 +234,7 @@ public class Mapper {
                     JoinTypes.INNER
                 );
                 if (eqJoin.unique()) {
-                    join = new DistinctByExec(eqJoin.source(), join, lookupOrdinalKey, true);
+                    join = new DistinctByExec(eqJoin.source(), join, sentinel, true);
                 }
                 return new ProjectExec(eqJoin.source(), join, eqJoin.output());
             }
