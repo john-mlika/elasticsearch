@@ -9,8 +9,6 @@ package org.elasticsearch.xpack.esql.plan.physical;
 
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinType;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
 
 import java.io.IOException;
 import java.util.List;
@@ -23,16 +21,11 @@ public class HashJoinExecSerializationTests extends AbstractPhysicalPlanSerializ
         List<Attribute> leftFields = randomFields();
         List<Attribute> rightFields = randomFields();
         List<Attribute> output = randomFields();
-        // match ordinal (non-build added field) is coordinator-ephemeral; serialize build-side added fields only
-        return new HashJoinExec(source, child, joinData, leftFields, rightFields, output, randomJoinType());
+        return new HashJoinExec(source, child, joinData, leftFields, rightFields, output);
     }
 
     private static List<Attribute> randomFields() {
         return randomFieldAttributes(1, 5, false);
-    }
-
-    private static JoinType randomJoinType() {
-        return randomFrom(JoinTypes.LEFT, JoinTypes.INNER);
     }
 
     @Override
@@ -47,17 +40,15 @@ public class HashJoinExecSerializationTests extends AbstractPhysicalPlanSerializ
         List<Attribute> leftFields = randomFieldAttributes(1, 5, false);
         List<Attribute> rightFields = randomFieldAttributes(1, 5, false);
         List<Attribute> output = randomFieldAttributes(1, 5, false);
-        JoinType joinType = instance.joinType();
-        switch (between(0, 5)) {
+        switch (between(0, 4)) {
             case 0 -> child = randomValueOtherThan(child, () -> randomChild(0));
             case 1 -> joinData = randomValueOtherThan(joinData, LocalSourceExecSerializationTests::randomLocalSourceExec);
             case 2 -> leftFields = randomValueOtherThan(leftFields, HashJoinExecSerializationTests::randomFields);
             case 3 -> rightFields = randomValueOtherThan(rightFields, HashJoinExecSerializationTests::randomFields);
             case 4 -> output = randomValueOtherThan(output, HashJoinExecSerializationTests::randomFields);
-            case 5 -> joinType = joinType == JoinTypes.LEFT ? JoinTypes.INNER : JoinTypes.LEFT;
             default -> throw new UnsupportedOperationException();
         }
-        return new HashJoinExec(instance.source(), child, joinData, leftFields, rightFields, output, joinType);
+        return new HashJoinExec(instance.source(), child, joinData, leftFields, rightFields, output);
     }
 
     @Override

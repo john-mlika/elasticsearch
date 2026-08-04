@@ -15,11 +15,11 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
-import org.elasticsearch.xpack.esql.plan.logical.join.EqJoin;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
+import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
+import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalSupplier;
-import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
+import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.HashJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -29,51 +29,48 @@ import org.elasticsearch.xpack.esql.session.Versioned;
 import java.util.List;
 
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.as;
-import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX;
+import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_MATCH_MARKER_PREFIX;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.hamcrest.Matchers.startsWith;
 
-public class EqJoinMapperTests extends ESTestCase {
+public class InnerJoinMapperTests extends ESTestCase {
 
-    public void testMapsUniqueEqJoinToDistinctByOverHashJoin() {
-        EqJoin eqJoin = eqJoin(true);
-        PhysicalPlan physical = new Mapper().map(new Versioned<>(eqJoin, TransportVersion.current()));
-
-        ProjectExec project = as(physical, ProjectExec.class);
-        assertThat(project.projections(), equalTo(eqJoin.output()));
-
-        DistinctByExec distinctBy = as(project.child(), DistinctByExec.class);
-        assertThat(distinctBy.failOnDuplicate(), equalTo(true));
-        assertThat(distinctBy.key().name(), startsWith(Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX + INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX));
-
-        HashJoinExec join = as(distinctBy.child(), HashJoinExec.class);
-        assertThat(join.joinType(), equalTo(JoinTypes.INNER));
-        assertThat(join.addedFields(), hasItem(sameInstance(distinctBy.key())));
-        assertThat(join.joinData(), instanceOf(LocalSourceExec.class));
-    }
-
-    public void testMapsNonUniqueEqJoinWithoutDistinctBy() {
-        EqJoin eqJoin = eqJoin(false);
-        PhysicalPlan physical = new Mapper().map(new Versioned<>(eqJoin, TransportVersion.current()));
+    public void testMapsInnerJoinToLeftHashJoinFilterOnMarker() {
+        InnerJoin innerJoin = innerJoin(false);
+        PhysicalPlan physical = new Mapper().map(new Versioned<>(innerJoin, TransportVersion.current()));
 
         ProjectExec project = as(physical, ProjectExec.class);
-        assertThat(project.projections(), equalTo(eqJoin.output()));
+        assertThat(project.projections(), equalTo(innerJoin.output()));
 
-        HashJoinExec join = as(project.child(), HashJoinExec.class);
-        assertThat(join.joinType(), equalTo(JoinTypes.INNER));
-        assertThat(nonBuildAddedFields(join), hasItem(instanceOf(ReferenceAttribute.class)));
+        FilterExec filter = as(project.child(), FilterExec.class);
+        IsNotNull isNotNull = as(filter.condition(), IsNotNull.class);
+        Attribute marker = as(isNotNull.field(), Attribute.class);
+        assertThat(marker.name(), startsWith(Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX + INTERN_JOIN_MATCH_MARKER_PREFIX));
+
+        HashJoinExec join = as(filter.child(), HashJoinExec.class);
+        assertThat(join.addedFields(), hasItem(sameInstance(marker)));
         assertThat(join.joinData(), instanceOf(LocalSourceExec.class));
+        LocalSourceExec build = as(join.joinData(), LocalSourceExec.class);
+        assertThat(build.output(), hasItem(sameInstance(marker)));
     }
 
-    private static List<Attribute> nonBuildAddedFields(HashJoinExec join) {
-        var buildOutput = join.joinData().outputSet();
-        return join.addedFields().stream().filter(f -> buildOutput.contains(f) == false).toList();
+    public void testMapsUniqueInnerJoinFailsOnDuplicateBuildKeys() {
+        InnerJoin innerJoin = innerJoin(true, new long[] { 10, 10 }, new long[] { 100, 200 });
+        var e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new Mapper().map(new Versioned<>(innerJoin, TransportVersion.current()))
+        );
+        assertThat(e.getMessage(), equalTo("input must not have duplicates when [failOnDuplicate] set to [true]"));
     }
 
-    private static EqJoin eqJoin(boolean unique) {
+    private static InnerJoin innerJoin(boolean unique) {
+        return innerJoin(unique, new long[] { 10, 20 }, new long[] { 100, 200 });
+    }
+
+    private static InnerJoin innerJoin(boolean unique, long[] buildKeys, long[] buildValues) {
         var blockFactory = TestBlockFactory.getNonBreakingInstance();
         ReferenceAttribute probeKey = new ReferenceAttribute(Source.EMPTY, "k", DataType.LONG);
         LocalRelation probe = new LocalRelation(
@@ -88,11 +85,11 @@ public class EqJoinMapperTests extends ESTestCase {
             List.of(buildKey, buildValue),
             LocalSupplier.of(
                 new Page(
-                    blockFactory.newLongArrayVector(new long[] { 10, 20 }, 2).asBlock(),
-                    blockFactory.newLongArrayVector(new long[] { 100, 200 }, 2).asBlock()
+                    blockFactory.newLongArrayVector(buildKeys, buildKeys.length).asBlock(),
+                    blockFactory.newLongArrayVector(buildValues, buildValues.length).asBlock()
                 )
             )
         );
-        return new EqJoin(Source.EMPTY, probe, build, List.of(probeKey), List.of(buildKey), List.of(buildValue), unique);
+        return new InnerJoin(Source.EMPTY, probe, build, List.of(probeKey), List.of(buildKey), List.of(buildValue), unique);
     }
 }

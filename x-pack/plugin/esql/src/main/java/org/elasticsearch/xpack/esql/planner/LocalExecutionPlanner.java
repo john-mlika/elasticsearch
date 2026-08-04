@@ -23,9 +23,7 @@ import org.elasticsearch.compute.Describable;
 import org.elasticsearch.compute.aggregation.blockhash.BlockHash;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
-import org.elasticsearch.compute.data.BooleanVector;
 import org.elasticsearch.compute.data.ElementType;
-import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.LocalCircuitBreaker;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.expression.ExpressionEvaluator;
@@ -159,12 +157,10 @@ import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Grok;
 import org.elasticsearch.xpack.esql.plan.logical.HighlightOptions;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
 import org.elasticsearch.xpack.esql.plan.physical.AggregateExec;
 import org.elasticsearch.xpack.esql.plan.physical.ChangePointExec;
 import org.elasticsearch.xpack.esql.plan.physical.CompoundOutputEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.DissectExec;
-import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
 import org.elasticsearch.xpack.esql.plan.physical.EnrichExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsStatsQueryExec;
@@ -236,8 +232,6 @@ import java.util.stream.Stream;
 import static java.util.Arrays.asList;
 import static java.util.stream.Collectors.joining;
 import static org.elasticsearch.compute.operator.ProjectOperator.ProjectOperatorFactory;
-import static org.elasticsearch.xpack.esql.core.expression.Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX;
-import static org.elasticsearch.xpack.esql.planner.mapper.Mapper.INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX;
 import static org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter.stringToInt;
 
 /**
@@ -463,8 +457,6 @@ public class LocalExecutionPlanner {
             return planEnrich(enrich, context);
         } else if (node instanceof HashJoinExec join) {
             return planHashJoin(join, context);
-        } else if (node instanceof DistinctByExec distinctBy) {
-            return planDistinctBy(distinctBy, context);
         } else if (node instanceof LookupJoinExec join) {
             return planLookupJoin(join, context);
         }
@@ -1417,31 +1409,17 @@ public class LocalExecutionPlanner {
     private PhysicalOperation planHashJoin(HashJoinExec join, LocalExecutionPlannerContext context) {
         PhysicalOperation source = plan(join.left(), context);
         int positionsChannel = source.layout.numberOfChannels();
-        var localSourceExec = (LocalSourceExec) join.joinData();
-        Page localData = localSourceExec.supplier().get();
-
-        // added fields not on the build side appends after the probe layout
-        Attribute lookupOrdinalKeyField = null;
-        for (var f : join.addedFields()) {
-            if (f.name() != null
-                && f.name().startsWith(SYNTHETIC_ATTRIBUTE_NAME_PREFIX + INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX)
-                && localSourceExec.outputSet().contains(f) == false) {
-                lookupOrdinalKeyField = f;
-                break;
-            }
-        }
 
         Layout.Builder layoutBuilder = source.layout.builder();
-        if (lookupOrdinalKeyField != null) {
-            layoutBuilder.append(lookupOrdinalKeyField);
-        }
         for (Attribute f : join.output()) {
-            if (join.left().outputSet().contains(f) || f.equals(lookupOrdinalKeyField)) {
+            if (join.left().outputSet().contains(f)) {
                 continue;
             }
             layoutBuilder.append(f);
         }
         Layout layout = layoutBuilder.build();
+        LocalSourceExec localSourceExec = (LocalSourceExec) join.joinData();
+        Page localData = localSourceExec.supplier().get();
 
         RowInTableLookupOperator.Key[] keys = new RowInTableLookupOperator.Key[join.leftFields().size()];
         int[] blockMapping = new int[join.leftFields().size()];
@@ -1464,23 +1442,12 @@ public class LocalExecutionPlanner {
             blockMapping[k] = input.channel();
         }
 
-        // Append lookup key ordinal for each probe row (null for a miss).
+        // Load the "positions" of each match
         source = source.with(new RowInTableLookupOperator.Factory(keys, blockMapping), layout);
 
-        // INNER: drop probe rows that did not match (null positions). LEFT keeps them and null-fills via ColumnLoad.
-        if (join.joinType() == JoinTypes.INNER) {
-            source = source.with(new FilterOperatorFactory(notNullChannel(positionsChannel)), layout);
-        } else if (join.joinType() != JoinTypes.LEFT) {
-            throw new EsqlIllegalArgumentException("unsupported hash join type [" + join.joinType() + "]");
-        }
-
-        // Load build-side added fields; non-build added fields are already the lookup key ordinal channel.
-        int loadedFields = 0;
+        // Load the "values" from each match
         var joinDataOutput = join.joinData().output();
         for (Attribute f : join.addedFields()) {
-            if (localSourceExec.outputSet().contains(f) == false) {
-                continue;
-            }
             Block localField = null;
             for (int l = 0; l < joinDataOutput.size(); l++) {
                 if (joinDataOutput.get(l).name().equals(f.name())) {
@@ -1494,59 +1461,13 @@ public class LocalExecutionPlanner {
                 new ColumnLoadOperator.Factory(new ColumnLoadOperator.Values(f.name(), localField), positionsChannel),
                 layout
             );
-            loadedFields++;
         }
 
-        // drop the lookup key ordinal channel when it was not requested as an added field.
-        if (lookupOrdinalKeyField == null) {
-            List<Integer> projection = new ArrayList<>();
-            IntStream.range(0, positionsChannel).boxed().forEach(projection::add);
-            IntStream.range(positionsChannel + 1, positionsChannel + 1 + loadedFields).boxed().forEach(projection::add);
-            return source.with(new ProjectOperatorFactory(projection), layout);
-        }
-        return source;
-    }
-
-    private PhysicalOperation planDistinctBy(DistinctByExec distinctBy, LocalExecutionPlannerContext context) {
-        PhysicalOperation source = plan(distinctBy.child(), context);
-        Layout.ChannelAndType key = source.layout.get(distinctBy.key().id());
-        if (key == null) {
-            throw new IllegalStateException("can't find input for distinct-by key [" + distinctBy.key() + "]");
-        }
-        if (key.type() != DataType.INTEGER) {
-            throw new EsqlIllegalArgumentException(
-                "distinct-by key [" + distinctBy.key() + "] must be INTEGER (match ordinal), got [" + key.type() + "]"
-            );
-        }
-        return source.with(new DistinctByOperator.OrdinalIntKeyFactory(key.channel(), distinctBy.failOnDuplicate()), source.layout);
-    }
-
-    /**
-     * A boolean condition, true where block {@code channel} is non-null. Used to drop unmatched
-     * (null lookup key ordinal) probe rows for INNER {@link HashJoinExec}.
-     */
-    private static ExpressionEvaluator.Factory notNullChannel(int channel) {
-        return driverContext -> new ExpressionEvaluator() {
-            @Override
-            public Block eval(Page page) {
-                IntBlock ordinals = page.getBlock(channel);
-                int positions = page.getPositionCount();
-                try (BooleanVector.FixedBuilder builder = driverContext.blockFactory().newBooleanVectorFixedBuilder(positions)) {
-                    for (int p = 0; p < positions; p++) {
-                        builder.appendBoolean(p, ordinals.isNull(p) == false);
-                    }
-                    return builder.build().asBlock();
-                }
-            }
-
-            @Override
-            public long baseRamBytesUsed() {
-                return 0;
-            }
-
-            @Override
-            public void close() {}
-        };
+        // Drop the "positions" of the match
+        List<Integer> projection = new ArrayList<>();
+        IntStream.range(0, positionsChannel).boxed().forEach(projection::add);
+        IntStream.range(positionsChannel + 1, positionsChannel + 1 + join.addedFields().size()).boxed().forEach(projection::add);
+        return source.with(new ProjectOperatorFactory(projection), layout);
     }
 
     private PhysicalOperation planLookupJoin(LookupJoinExec join, LocalExecutionPlannerContext context) {

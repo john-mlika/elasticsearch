@@ -17,8 +17,6 @@ import org.elasticsearch.xpack.esql.core.expression.Expressions;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinType;
-import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -28,11 +26,6 @@ import java.util.Set;
 
 import static org.elasticsearch.xpack.esql.expression.NamedExpressions.mergeOutputAttributes;
 
-/**
- * Broadcast hash join over a materialized build side. {@link #joinType()} selects match semantics
- * ({@link JoinTypes#LEFT} null-fills on miss; {@link JoinTypes#INNER} drops unmatched probe rows).
- * {@link #addedFields()} are columns added to the join output.
- */
 public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
     public static final NamedWriteableRegistry.Entry ENTRY = new NamedWriteableRegistry.Entry(
         PhysicalPlan.class,
@@ -40,18 +33,13 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
         HashJoinExec::new
     );
     private static final TransportVersion ESQL_LOOKUP_JOIN_ON_EXPRESSION = TransportVersion.fromName("esql_lookup_join_on_expression");
-    private static final TransportVersion ESQL_HASH_JOIN_INNER_UNIQUE = TransportVersion.fromName("esql_hash_join_inner_unique");
 
     private final List<Attribute> leftFields;
     private final List<Attribute> rightFields;
     private final List<Attribute> addedFields;
-    private final JoinType joinType;
     private List<Attribute> lazyOutput;
     private AttributeSet lazyAddedFields;
 
-    /**
-     * LEFT outer hash join.
-     */
     public HashJoinExec(
         Source source,
         PhysicalPlan left,
@@ -60,23 +48,10 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
         List<Attribute> rightFields,
         List<Attribute> addedFields
     ) {
-        this(source, left, hashData, leftFields, rightFields, addedFields, JoinTypes.LEFT);
-    }
-
-    public HashJoinExec(
-        Source source,
-        PhysicalPlan left,
-        PhysicalPlan hashData,
-        List<Attribute> leftFields,
-        List<Attribute> rightFields,
-        List<Attribute> addedFields,
-        JoinType joinType
-    ) {
         super(source, left, hashData);
         this.leftFields = leftFields;
         this.rightFields = rightFields;
         this.addedFields = addedFields;
-        this.joinType = joinType;
     }
 
     private HashJoinExec(StreamInput in) throws IOException {
@@ -87,11 +62,6 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
         this.leftFields = in.readNamedWriteableCollectionAsList(Attribute.class);
         this.rightFields = in.readNamedWriteableCollectionAsList(Attribute.class);
         this.addedFields = in.readNamedWriteableCollectionAsList(Attribute.class);
-        if (in.getTransportVersion().supports(ESQL_HASH_JOIN_INNER_UNIQUE)) {
-            this.joinType = JoinTypes.readFrom(in);
-        } else {
-            this.joinType = JoinTypes.LEFT;
-        }
     }
 
     @Override
@@ -103,9 +73,6 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
         out.writeNamedWriteableCollection(leftFields);
         out.writeNamedWriteableCollection(rightFields);
         out.writeNamedWriteableCollection(addedFields);
-        if (out.getTransportVersion().supports(ESQL_HASH_JOIN_INNER_UNIQUE)) {
-            joinType.writeTo(out);
-        }
     }
 
     @Override
@@ -132,10 +99,6 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
         return lazyAddedFields;
     }
 
-    public JoinType joinType() {
-        return joinType;
-    }
-
     @Override
     public PhysicalPlan estimateRowSize(State state) {
         state.add(false, addedFields);
@@ -150,12 +113,7 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
             rightWithAppendedKeys.removeAll(rightFields);
             rightWithAppendedKeys.addAll(leftFields);
 
-            lazyOutput = new ArrayList<>(mergeOutputAttributes(rightWithAppendedKeys, leftOutputWithoutKeys));
-            for (Attribute f : addedFields) {
-                if (lazyOutput.contains(f) == false) {
-                    lazyOutput.add(f);
-                }
-            }
+            lazyOutput = mergeOutputAttributes(rightWithAppendedKeys, leftOutputWithoutKeys);
         }
         return lazyOutput;
     }
@@ -183,12 +141,12 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
 
     @Override
     public HashJoinExec replaceChildren(PhysicalPlan left, PhysicalPlan right) {
-        return new HashJoinExec(source(), left, right, leftFields, rightFields, addedFields, joinType);
+        return new HashJoinExec(source(), left, right, leftFields, rightFields, addedFields);
     }
 
     @Override
     protected NodeInfo<? extends PhysicalPlan> info() {
-        return NodeInfo.create(this, HashJoinExec::new, left(), right(), leftFields, rightFields, addedFields, joinType);
+        return NodeInfo.create(this, HashJoinExec::new, left(), right(), leftFields, rightFields, addedFields);
     }
 
     @Override
@@ -203,14 +161,11 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
             return false;
         }
         HashJoinExec hash = (HashJoinExec) o;
-        return joinType.equals(hash.joinType)
-            && leftFields.equals(hash.leftFields)
-            && rightFields.equals(hash.rightFields)
-            && addedFields.equals(hash.addedFields);
+        return leftFields.equals(hash.leftFields) && rightFields.equals(hash.rightFields) && addedFields.equals(hash.addedFields);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), leftFields, rightFields, addedFields, joinType);
+        return Objects.hash(super.hashCode(), leftFields, rightFields, addedFields);
     }
 }

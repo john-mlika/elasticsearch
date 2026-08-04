@@ -114,8 +114,8 @@ import org.elasticsearch.xpack.esql.plan.logical.Row;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedIpLocation;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedRelation;
 import org.elasticsearch.xpack.esql.plan.logical.join.AbstractSubqueryJoin;
-import org.elasticsearch.xpack.esql.plan.logical.join.EqJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.InlineJoin;
+import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.LookupJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.StubRelation;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
@@ -947,7 +947,7 @@ public class EsqlSession {
     ) {
         SubPlanAndCallback subPlanAndCallback = null;
 
-        // Find the first (bottom-up) SemiJoin/EqJoin/InlineJoin that needs subplan execution.
+        // Find the first (bottom-up) SemiJoin/InnerJoin/InlineJoin that needs subplan execution.
         // Processing bottom-up ensures inner subplans (e.g. INLINE STATS inside IN subquery)
         // are resolved before outer ones that depend on them.
         LogicalPlan firstJoin = findFirstSubPlanJoin(mainPlan, subPlansResults);
@@ -973,15 +973,30 @@ public class EsqlSession {
                     );
                 }, () -> releaseLocalRelationBlocks(localRelationPage), true);
             }
-        } else if (firstJoin instanceof EqJoin) {
-            EqJoin.LogicalPlanTuple subPlans = EqJoin.firstSubPlan(mainPlan, subPlansResults);
+        } else if (firstJoin instanceof InnerJoin) {
+            InnerJoin.LogicalPlanTuple subPlans = InnerJoin.firstSubPlan(mainPlan, subPlansResults);
             if (subPlans != null) {
                 AtomicReference<Page> localRelationPage = new AtomicReference<>();
                 subPlanAndCallback = new SubPlanAndCallback(subPlans.subPlan(), result -> {
                     LocalRelation resultWrapper = resultToPlan(subPlans.subPlan().source(), result);
-                    localRelationPage.set(resultWrapper.supplier().get());
-                    subPlansResults.add(resultWrapper);
-                    return EqJoin.newMainPlan(mainPlan, subPlans, resultWrapper);
+                    // Prepare match-marker (+ build distinct when unique) here so page ownership for
+                    // cleanup tracks the marked page, not the pre-marker LocalRelation page.
+                    InnerJoin innerJoin = findInnerJoinForSubPlan(mainPlan, subPlans.originalSubPlan());
+                    var marker = Mapper.newMatchMarker(innerJoin.source());
+                    var prepared = Mapper.prepareInnerJoinBuildSide(
+                        new LocalSourceExec(resultWrapper.source(), resultWrapper.output(), resultWrapper.supplier()),
+                        innerJoin.rightFields(),
+                        innerJoin.unique(),
+                        marker
+                    );
+                    LocalRelation marked = new LocalRelation(prepared.source(), prepared.output(), prepared.supplier());
+                    Page oldPage = resultWrapper.supplier().get();
+                    localRelationPage.set(marked.supplier().get());
+                    // Shared blocks were incRef'd by prepareInnerJoinBuildSide; closing the old page
+                    // drops only the original refs. Cleanup later releases the marked page.
+                    Releasables.closeExpectNoException(oldPage);
+                    subPlansResults.add(marked);
+                    return InnerJoin.newMainPlan(mainPlan, subPlans, marked);
                 }, () -> releaseLocalRelationBlocks(localRelationPage), true);
             }
         } else if (firstJoin instanceof InlineJoin) {
@@ -1016,26 +1031,41 @@ public class EsqlSession {
         return subPlanAndCallback;
     }
 
+    private static InnerJoin findInnerJoinForSubPlan(LogicalPlan plan, LogicalPlan originalSubPlan) {
+        Holder<InnerJoin> result = new Holder<>();
+        plan.forEachUp(InnerJoin.class, join -> {
+            if (result.get() == null && join.right() == originalSubPlan) {
+                result.set(join);
+            }
+        });
+        InnerJoin innerJoin = result.get();
+        if (innerJoin == null) {
+            throw new IllegalStateException("couldn't find InnerJoin for materialized subplan");
+        }
+        return innerJoin;
+    }
+
     /**
-     * Finds the first (bottom-up) SemiJoin, EqJoin or InlineJoin in the plan that has an unresolved subplan.
+     * Finds the first (bottom-up) SemiJoin, InnerJoin or InlineJoin in the plan that has an unresolved subplan.
      * Returns the join node itself, or null if none found.
      */
     private static LogicalPlan findFirstSubPlanJoin(LogicalPlan plan, Set<LocalRelation> subPlansResults) {
         Holder<LogicalPlan> result = new Holder<>();
-        // Evaluate the right hand side of a SemiJoin/EqJoin/InlineJoin, unless it is a LocalRelation and registered in subPlansResults
+        // Evaluate the right hand side of a SemiJoin/InnerJoin/InlineJoin, unless it is a LocalRelation and registered in subPlansResults
         // already
         plan.forEachUp(p -> {
             if (result.get() != null) {
                 return;
             }
-            // Whether checking the subquery join, EqJoin or InlineJoin first does not matter, the plan is processed bottom up, looking for
+            // Whether checking the subquery join, InnerJoin or InlineJoin first does not matter, the plan is processed bottom up, looking
+            // for
             // joins whose right child haven't been evaluated yet
             if (p instanceof AbstractSubqueryJoin sj) {
                 if (sj.right() instanceof LocalRelation lr && subPlansResults.contains(lr)) {
                     return; // already processed
                 }
                 result.set(sj);
-            } else if (p instanceof EqJoin ej) {
+            } else if (p instanceof InnerJoin ej) {
                 if (ej.right() instanceof LocalRelation lr && subPlansResults.contains(lr)) {
                     return; // already processed
                 }

@@ -13,7 +13,7 @@ import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.util.Holder;
-import org.elasticsearch.xpack.esql.plan.logical.ExecutesOn;
+import org.elasticsearch.xpack.esql.plan.logical.ExecutesOn.ExecuteLocation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.SortPreserving;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
@@ -29,15 +29,23 @@ import static java.util.stream.Stream.concat;
 import static org.elasticsearch.xpack.esql.expression.NamedExpressions.mergeOutputAttributes;
 
 /**
- * Specialized type of join that matches rows with identical values in the specified columns.
+ * Coordinator-ephemeral INNER equi-join. Unmatched probe rows are dropped; the physical lowering is
+ * LEFT {@code HashJoinExec} plus a plan-time build-side match marker filtered with {@code IS NOT NULL}.
  */
-public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinator {
+public class InnerJoin extends Join implements SortPreserving {
+
+    /**
+     * Prefix for the synthetic build-side match marker used to encode INNER via LEFT hash-join +
+     * {@code IS NOT NULL}. Kept here (not only in the mapper) so {@link #output()} can hide the marker
+     * when the build {@link LocalRelation} was enriched before mapping.
+     */
+    public static final String MATCH_MARKER_NAME_PREFIX = Attribute.SYNTHETIC_ATTRIBUTE_NAME_PREFIX + "join_match_marker";
 
     private final List<Attribute> addedFields;
     private final boolean unique;
     private List<Attribute> lazyOutput;
 
-    public EqJoin(
+    public InnerJoin(
         Source source,
         LogicalPlan left,
         LogicalPlan right,
@@ -46,7 +54,7 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
         List<Attribute> addedFields,
         boolean unique
     ) {
-        super(source, left, right, JoinTypes.INNER, leftFields, rightFields, null, ExecuteLocation.ANY);
+        super(source, left, right, JoinTypes.INNER, leftFields, rightFields, null, ExecuteLocation.COORDINATOR);
         this.addedFields = addedFields;
         this.unique = unique;
     }
@@ -80,12 +88,20 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
     @Override
     public List<Attribute> output() {
         if (lazyOutput == null) {
+            // Exclude the plan-time INNER match marker if the build LocalRelation was already enriched.
             lazyOutput = mergeOutputAttributes(
-                concat(right().output().stream().filter(not(rightFields()::contains)), leftFields().stream()).toList(),
+                concat(
+                    right().output().stream().filter(not(rightFields()::contains)).filter(not(InnerJoin::isMatchMarker)),
+                    leftFields().stream()
+                ).toList(),
                 left().output().stream().filter(not(leftFields()::contains)).toList()
             );
         }
         return lazyOutput;
+    }
+
+    public static boolean isMatchMarker(Attribute attr) {
+        return attr.name() != null && attr.name().startsWith(MATCH_MARKER_NAME_PREFIX);
     }
 
     @Override
@@ -99,11 +115,11 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
     }
 
     /**
-     * Finds the first (bottom-up) {@link EqJoin} whose right subquery has not yet been replaced with results.
+     * Finds the first (bottom-up) {@link InnerJoin} whose right subquery has not yet been replaced with results.
      */
     public static LogicalPlanTuple firstSubPlan(LogicalPlan optimizedPlan, Set<LocalRelation> subPlansResults) {
         var subPlanHolder = new Holder<LogicalPlan>();
-        optimizedPlan.forEachUp(EqJoin.class, join -> {
+        optimizedPlan.forEachUp(InnerJoin.class, join -> {
             if (subPlanHolder.get() == null) {
                 if ((join.right() instanceof LocalRelation lr && subPlansResults.contains(lr)) == false) {
                     subPlanHolder.set(join.right());
@@ -122,12 +138,12 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
     }
 
     /**
-     * Rebuilds the main plan after the right-side subquery has been materialized, replacing the matching EqJoin's right child with
+     * Rebuilds the main plan after the right-side subquery has been materialized, replacing the matching InnerJoin's right child with
      * the materialized local relation.
      */
     public static LogicalPlan newMainPlan(LogicalPlan optimizedPlan, LogicalPlanTuple subPlans, LocalRelation resultWrapper) {
         LogicalPlan newPlan = optimizedPlan.transformUp(
-            EqJoin.class,
+            InnerJoin.class,
             join -> join.right() == subPlans.originalSubPlan() ? join.replaceRight(resultWrapper) : join
         );
         newPlan.setOptimized();
@@ -135,13 +151,13 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
     }
 
     @Override
-    public EqJoin replaceChildren(LogicalPlan left, LogicalPlan right) {
-        return new EqJoin(source(), left, right, leftFields(), rightFields(), addedFields, unique);
+    public InnerJoin replaceChildren(LogicalPlan left, LogicalPlan right) {
+        return new InnerJoin(source(), left, right, leftFields(), rightFields(), addedFields, unique);
     }
 
     @Override
     protected NodeInfo<Join> info() {
-        return NodeInfo.create(this, EqJoin::new, left(), right(), leftFields(), rightFields(), addedFields, unique);
+        return NodeInfo.create(this, InnerJoin::new, left(), right(), leftFields(), rightFields(), addedFields, unique);
     }
 
     @Override
@@ -155,8 +171,8 @@ public class EqJoin extends Join implements SortPreserving, ExecutesOn.Coordinat
         if (super.equals(o) == false) {
             return false;
         }
-        EqJoin eqJoin = (EqJoin) o;
-        return unique == eqJoin.unique && addedFields.equals(eqJoin.addedFields);
+        InnerJoin innerJoin = (InnerJoin) o;
+        return unique == innerJoin.unique && addedFields.equals(innerJoin.addedFields);
     }
 
     @Override

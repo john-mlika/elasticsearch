@@ -8,12 +8,25 @@
 package org.elasticsearch.xpack.esql.planner.mapper;
 
 import org.elasticsearch.compute.aggregation.AggregatorMode;
+import org.elasticsearch.compute.aggregation.GroupingAggregatorFunction;
+import org.elasticsearch.compute.aggregation.blockhash.BlockHash;
+import org.elasticsearch.compute.data.Block;
+import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.IntArrayBlock;
+import org.elasticsearch.compute.data.IntBigArrayBlock;
+import org.elasticsearch.compute.data.IntVector;
+import org.elasticsearch.compute.data.Page;
+import org.elasticsearch.compute.operator.Operator;
+import org.elasticsearch.core.Releasables;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
+import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.grouping.GroupingFunction;
+import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
@@ -33,12 +46,13 @@ import org.elasticsearch.xpack.esql.plan.logical.TopN;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
 import org.elasticsearch.xpack.esql.plan.logical.TsInfo;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
-import org.elasticsearch.xpack.esql.plan.logical.join.EqJoin;
+import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.Join;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinConfig;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
-import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
+import org.elasticsearch.xpack.esql.plan.logical.local.LocalSupplier;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
+import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.HashJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitByExec;
@@ -67,7 +81,8 @@ import java.util.List;
  */
 public class Mapper {
 
-    public static final String INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX = "joined_on_key_ordinal";
+    /** @see InnerJoin#MATCH_MARKER_NAME_PREFIX */
+    public static final String INTERN_JOIN_MATCH_MARKER_PREFIX = "join_match_marker";
 
     public PhysicalPlan map(Versioned<LogicalPlan> versionedPlan) {
         // We ignore the version for now, but it's fine to use later for plans that work
@@ -210,33 +225,32 @@ public class Mapper {
     }
 
     private PhysicalPlan mapBinary(BinaryPlan bp) {
-        if (bp instanceof EqJoin eqJoin) {
+        if (bp instanceof InnerJoin innerJoin) {
             PhysicalPlan left = mapInner(bp.left());
             PhysicalPlan right = mapInner(bp.right());
             if (right instanceof LocalSourceExec localData) {
-                // add ordinal to lookup table position (i.e. what position matched from the right)
-                // used by subsequent DistinctBy for one-to-one joins
-                var sentinel = new ReferenceAttribute(
-                    eqJoin.source(),
-                    null,
-                    TemporaryNameGenerator.locallyUniqueTemporaryName(INTERN_JOIN_ON_LOOKUP_ORDINAL_PREFIX),
-                    DataType.INTEGER
-                );
-                var addedFields = new ArrayList<>(eqJoin.addedFields());
-                addedFields.add(sentinel);
-                PhysicalPlan join = new HashJoinExec(
-                    eqJoin.source(),
-                    left,
-                    localData,
-                    eqJoin.leftFields(),
-                    eqJoin.rightFields(),
-                    addedFields,
-                    JoinTypes.INNER
-                );
-                if (eqJoin.unique()) {
-                    join = new DistinctByExec(eqJoin.source(), join, sentinel, true);
+                // INNER = LEFT hash-join + filter on a dedicated build-side match marker.
+                // Marker and (when unique) build-key distinctness are applied at plan time so
+                // HashJoinExec stays a pure LEFT broadcast lookup. The build side may already
+                // carry the marker when EsqlSession prepared it (page-ownership transfer).
+                Attribute marker = findMatchMarker(localData.output());
+                LocalSourceExec build = localData;
+                if (marker == null) {
+                    marker = newMatchMarker(innerJoin.source());
+                    build = prepareInnerJoinBuildSide(localData, innerJoin.rightFields(), innerJoin.unique(), marker);
                 }
-                return new ProjectExec(eqJoin.source(), join, eqJoin.output());
+                List<Attribute> addedFields = new ArrayList<>(innerJoin.addedFields());
+                addedFields.add(marker);
+                PhysicalPlan join = new HashJoinExec(
+                    innerJoin.source(),
+                    left,
+                    build,
+                    innerJoin.leftFields(),
+                    innerJoin.rightFields(),
+                    addedFields
+                );
+                join = new FilterExec(innerJoin.source(), join, new IsNotNull(innerJoin.source(), marker));
+                return new ProjectExec(innerJoin.source(), join, innerJoin.output());
             }
             return MapperUtils.unsupported(bp);
         }
@@ -346,5 +360,166 @@ public class Mapper {
             child = new ExchangeExec(child.source(), child);
         }
         return child;
+    }
+
+    public static ReferenceAttribute newMatchMarker(Source source) {
+        return new ReferenceAttribute(
+            source,
+            null,
+            TemporaryNameGenerator.locallyUniqueTemporaryName(INTERN_JOIN_MATCH_MARKER_PREFIX),
+            DataType.INTEGER,
+            Nullability.TRUE,
+            null,
+            true
+        );
+    }
+
+    public static Attribute findMatchMarker(List<Attribute> output) {
+        for (Attribute attr : output) {
+            if (InnerJoin.isMatchMarker(attr)) {
+                return attr;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * When {@code unique}, fails if the build join keys are not distinct. Always appends a constant
+     * {@code marker=1} column so unmatched probe rows can be dropped with {@code marker IS NOT NULL}.
+     * <p>
+     * Applied at plan time because {@link HashJoinExec} requires a materialized {@link LocalSourceExec}
+     * build side (a DistinctBy cannot wrap the build under the join). Shared build blocks are
+     * {@link Block#incRef()}'d so the caller may close the original page without freeing them; the
+     * returned {@link LocalSourceExec} owns the marked page (shared blocks + marker).
+     */
+    public static LocalSourceExec prepareInnerJoinBuildSide(
+        LocalSourceExec build,
+        List<Attribute> rightFields,
+        boolean unique,
+        Attribute marker
+    ) {
+        Page page = build.supplier().get();
+        if (page.getBlockCount() == 0) {
+            throw new EsqlIllegalArgumentException("inner-join build side has no columns");
+        }
+        BlockFactory blockFactory = page.getBlock(0).blockFactory();
+        if (unique) {
+            ensureDistinctBuildKeys(page, build.output(), rightFields, blockFactory);
+        }
+        Block markerBlock = null;
+        Page markedPage = null;
+        int retained = 0;
+        boolean success = false;
+        try {
+            markerBlock = blockFactory.newConstantIntBlockWith(1, page.getPositionCount());
+            Block[] blocks = new Block[page.getBlockCount() + 1];
+            for (int i = 0; i < page.getBlockCount(); i++) {
+                Block b = page.getBlock(i);
+                b.incRef();
+                retained++;
+                blocks[i] = b;
+            }
+            blocks[page.getBlockCount()] = markerBlock;
+            markerBlock = null;
+            markedPage = new Page(blocks);
+            success = true;
+        } finally {
+            if (success == false) {
+                // Roll back any incRefs taken before failure; markerBlock/markedPage closed below.
+                for (int i = 0; i < retained; i++) {
+                    page.getBlock(i).close();
+                }
+                Releasables.closeExpectNoException(markerBlock, markedPage);
+            }
+        }
+        List<Attribute> output = new ArrayList<>(build.output());
+        output.add(marker);
+        return new LocalSourceExec(build.source(), output, LocalSupplier.of(markedPage));
+    }
+
+    /**
+     * Fails when non-null build join-key rows are not unique (same contract as DistinctBy with
+     * {@code failOnDuplicate=true}).
+     */
+    private static void ensureDistinctBuildKeys(Page page, List<Attribute> output, List<Attribute> rightFields, BlockFactory blockFactory) {
+        if (page.getPositionCount() <= 1 || rightFields.isEmpty()) {
+            return;
+        }
+        int[] keyChannels = new int[rightFields.size()];
+        List<BlockHash.GroupSpec> groupSpecs = new ArrayList<>(rightFields.size());
+        for (int k = 0; k < rightFields.size(); k++) {
+            Attribute key = rightFields.get(k);
+            int channel = -1;
+            for (int i = 0; i < output.size(); i++) {
+                if (output.get(i).name().equals(key.name())) {
+                    channel = i;
+                    break;
+                }
+            }
+            if (channel < 0) {
+                throw new IllegalArgumentException("can't find build key [" + key + "]");
+            }
+            keyChannels[k] = channel;
+            groupSpecs.add(new BlockHash.GroupSpec(channel, page.getBlock(channel).elementType()));
+        }
+        int nonNullRows = countNonNullKeyRows(page, keyChannels);
+        if (nonNullRows <= 1) {
+            return;
+        }
+        int emitBatchSize = Operator.TARGET_PAGE_SIZE / Long.SIZE;
+        try (BlockHash hash = BlockHash.build(groupSpecs, blockFactory, emitBatchSize, false)) {
+            hash.add(page, NOOP_ADD_INPUT);
+            try (IntVector selected = hash.nonEmpty()) {
+                int distinctGroups = selected.getPositionCount();
+                boolean hasNullGroup = distinctGroups > 0 && selected.getInt(0) == 0 && countNullKeyRows(page, keyChannels) > 0;
+                int distinctNonNull = distinctGroups - (hasNullGroup ? 1 : 0);
+                if (distinctNonNull < nonNullRows) {
+                    throw new IllegalArgumentException("input must not have duplicates when [failOnDuplicate] set to [true]");
+                }
+            }
+        }
+    }
+
+    private static final GroupingAggregatorFunction.AddInput NOOP_ADD_INPUT = new GroupingAggregatorFunction.AddInput() {
+        @Override
+        public void add(int positionOffset, IntArrayBlock groupIds) {}
+
+        @Override
+        public void add(int positionOffset, IntBigArrayBlock groupIds) {}
+
+        @Override
+        public void add(int positionOffset, IntVector groupIds) {}
+
+        @Override
+        public void close() {}
+    };
+
+    private static int countNonNullKeyRows(Page page, int[] keyChannels) {
+        int count = 0;
+        for (int p = 0; p < page.getPositionCount(); p++) {
+            if (isNullKeyRow(page, keyChannels, p) == false) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int countNullKeyRows(Page page, int[] keyChannels) {
+        int count = 0;
+        for (int p = 0; p < page.getPositionCount(); p++) {
+            if (isNullKeyRow(page, keyChannels, p)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static boolean isNullKeyRow(Page page, int[] keyChannels, int position) {
+        for (int channel : keyChannels) {
+            if (page.getBlock(channel).isNull(position)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
