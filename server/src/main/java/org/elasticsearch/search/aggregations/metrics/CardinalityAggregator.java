@@ -323,6 +323,32 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
 
         @Override
         public void postCollect() throws IOException {
+            long bucketWithOrds = -1;
+            int bucketsWithOrds = 0;
+            for (long bucket = visitedOrds.size() - 1; bucket >= 0 && bucketsWithOrds < 2; --bucket) {
+                if (visitedOrds.get(bucket) != null) {
+                    bucketWithOrds = bucket;
+                    bucketsWithOrds++;
+                }
+            }
+            if (bucketsWithOrds == 0) {
+                // Nothing was collected in this segment, so there is no ordinal to hash.
+                return;
+            }
+            if (bucketsWithOrds == 1) {
+                // With a single bucket every visited ordinal is hashed exactly once either way, so the maxOrd-sized
+                // union and hash arrays buy nothing: hash the ordinals as we visit them.
+                final BitArray bits = visitedOrds.get(bucketWithOrds);
+                final MurmurHash3.Hash128 hash = new MurmurHash3.Hash128();
+                for (long ord = bits.nextSetBit(0); ord < Long.MAX_VALUE; ord = ord + 1 < maxOrd
+                    ? bits.nextSetBit(ord + 1)
+                    : Long.MAX_VALUE) {
+                    final BytesRef value = values.lookupOrd(ord);
+                    MurmurHash3.hash128(value.bytes, value.offset, value.length, 0, hash);
+                    counts.collect(bucketWithOrds, hash.h1);
+                }
+                return;
+            }
             try (BitArray allVisitedOrds = new BitArray(maxOrd, bigArrays)) {
                 for (long bucket = visitedOrds.size() - 1; bucket >= 0; --bucket) {
                     final BitArray bits = visitedOrds.get(bucket);

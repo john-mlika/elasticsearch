@@ -18,20 +18,31 @@ import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.cluster.project.TestProjectResolvers;
+import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.geo.GeoPoint;
 import org.elasticsearch.common.hash.MurmurHash3;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.common.network.InetAddresses;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
+import org.elasticsearch.common.util.LongArray;
+import org.elasticsearch.common.util.MockBigArrays;
+import org.elasticsearch.common.util.MockPageCacheRecycler;
 import org.elasticsearch.core.CheckedConsumer;
+import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.fielddata.ScriptDocValues;
 import org.elasticsearch.index.mapper.IpFieldMapper;
@@ -42,6 +53,7 @@ import org.elasticsearch.index.mapper.RangeFieldMapper;
 import org.elasticsearch.index.mapper.RangeType;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
 import org.elasticsearch.index.mapper.vectors.SparseVectorFieldMapper;
+import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
 import org.elasticsearch.script.MockScriptEngine;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptEngine;
@@ -63,6 +75,7 @@ import org.elasticsearch.search.aggregations.support.ValuesSourceType;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -70,6 +83,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -77,6 +91,8 @@ import static java.util.Collections.emptyMap;
 import static java.util.Collections.singleton;
 import static org.elasticsearch.test.MapMatcher.assertMap;
 import static org.elasticsearch.test.MapMatcher.matchesMap;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 public class CardinalityAggregatorTests extends AggregatorTestCase {
@@ -1077,6 +1093,172 @@ public class CardinalityAggregatorTests extends AggregatorTestCase {
             },
             mappedFieldTypes
         );
+    }
+
+    /**
+     * With a single bucket the ordinals collector hashes the visited ordinals directly: the sketch must be byte-for-byte
+     * the one built by hashing them once in ascending order, which the union path also builds.
+     */
+    public void testOrdinalsCollectorSingleBucketMatchesUnion() throws IOException {
+        final int precision = randomIntBetween(HyperLogLogPlusPlus.MIN_PRECISION, 14);
+        final int distinct = randomIntBetween(1, 5000);
+        final List<Tuple<Long, Boolean>> longArrays = new ArrayList<>();
+        final BigArrays bigArrays = new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), new NoneCircuitBreakerService()) {
+            @Override
+            public LongArray newLongArray(long size, boolean clearOnResize) {
+                longArrays.add(new Tuple<>(size, clearOnResize));
+                return super.newLongArray(size, clearOnResize);
+            }
+        };
+        try (Directory directory = newDirectory(); RandomIndexWriter iw = new RandomIndexWriter(random(), directory)) {
+            final int numDocs = randomIntBetween(1, 3000);
+            for (int i = 0; i < numDocs; i++) {
+                final List<SortedSetDocValuesField> fields = new ArrayList<>();
+                for (int v = randomIntBetween(i == 0 ? 1 : 0, 3); v > 0; v--) {
+                    fields.add(new SortedSetDocValuesField("str_values", new BytesRef(Integer.toString(randomInt(distinct)))));
+                }
+                iw.addDocument(fields);
+                if (rarely()) {
+                    iw.commit();
+                }
+            }
+            try (IndexReader reader = iw.getReader()) {
+                int leavesWithValues = 0;
+                for (LeafReaderContext leaf : reader.leaves()) {
+                    final SortedSetDocValues values = DocValues.getSortedSet(leaf.reader(), "str_values");
+                    if (values.getValueCount() == 0) {
+                        continue;
+                    }
+                    leavesWithValues++;
+                    // bucket 0, a top level cardinality, is covered by the existing tests
+                    final long bucket = randomLongBetween(1, 5);
+                    final boolean[] selected = new boolean[leaf.reader().maxDoc()];
+                    final TreeSet<Long> visited = new TreeSet<>();
+                    int firstDocWithValue = -1;
+                    int otherDoc = -1;
+                    for (int doc = 0; doc < selected.length; doc++) {
+                        if (values.advanceExact(doc)) {
+                            if (firstDocWithValue == -1) {
+                                firstDocWithValue = doc;
+                                selected[doc] = true;
+                            } else {
+                                selected[doc] = randomBoolean();
+                            }
+                            if (selected[doc]) {
+                                for (int i = 0; i < values.docValueCount(); i++) {
+                                    visited.add(values.nextOrd());
+                                }
+                            } else if (otherDoc == -1) {
+                                otherDoc = doc;
+                            }
+                        }
+                    }
+                    if (otherDoc == -1) {
+                        otherDoc = firstDocWithValue;
+                    }
+
+                    try (
+                        HyperLogLogPlusPlus expected = new HyperLogLogPlusPlus(precision, bigArrays, 1);
+                        HyperLogLogPlusPlus single = new HyperLogLogPlusPlus(precision, bigArrays, 1);
+                        HyperLogLogPlusPlus union = new HyperLogLogPlusPlus(precision, bigArrays, 1)
+                    ) {
+                        final MurmurHash3.Hash128 hash = new MurmurHash3.Hash128();
+                        for (long ord : visited) {
+                            final BytesRef value = values.lookupOrd(ord);
+                            MurmurHash3.hash128(value.bytes, value.offset, value.length, 0, hash);
+                            expected.collect(bucket, hash.h1);
+                        }
+
+                        final CardinalityAggregator.OrdinalsCollector singleBucket = new CardinalityAggregator.OrdinalsCollector(
+                            single,
+                            DocValues.getSortedSet(leaf.reader(), "str_values"),
+                            bigArrays
+                        );
+                        try {
+                            for (int doc = 0; doc < selected.length; doc++) {
+                                if (selected[doc]) {
+                                    singleBucket.collect(doc, bucket);
+                                }
+                            }
+                            longArrays.clear();
+                            singleBucket.postCollect();
+                            // no maxOrd-sized array of hashes
+                            assertThat(longArrays.stream().filter(a -> a.v2() == false).toList(), empty());
+                        } finally {
+                            singleBucket.close();
+                        }
+
+                        final CardinalityAggregator.OrdinalsCollector twoBuckets = new CardinalityAggregator.OrdinalsCollector(
+                            union,
+                            DocValues.getSortedSet(leaf.reader(), "str_values"),
+                            bigArrays
+                        );
+                        try {
+                            for (int doc = 0; doc < selected.length; doc++) {
+                                if (selected[doc]) {
+                                    twoBuckets.collect(doc, bucket);
+                                }
+                                if (doc == otherDoc) {
+                                    twoBuckets.collect(doc, bucket + 1);
+                                }
+                            }
+                            twoBuckets.postCollect();
+                        } finally {
+                            twoBuckets.close();
+                        }
+
+                        assertEquals(expected.cardinality(bucket), single.cardinality(bucket));
+                        assertArrayEquals(sketchBytes(expected, bucket), sketchBytes(single, bucket));
+                        assertArrayEquals(sketchBytes(expected, bucket), sketchBytes(union, bucket));
+                    }
+                }
+                assertThat(leavesWithValues, greaterThan(0));
+            }
+        }
+    }
+
+    /**
+     * A segment in which the aggregation collected nothing must not build the maxOrd-sized union and hash arrays.
+     */
+    public void testOrdinalsCollectorNothingCollected() throws IOException {
+        final List<Long> longArrays = new ArrayList<>();
+        final BigArrays bigArrays = new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), new NoneCircuitBreakerService()) {
+            @Override
+            public LongArray newLongArray(long size, boolean clearOnResize) {
+                longArrays.add(size);
+                return super.newLongArray(size, clearOnResize);
+            }
+        };
+        try (Directory directory = newDirectory(); RandomIndexWriter iw = new RandomIndexWriter(random(), directory)) {
+            final int numDocs = randomIntBetween(1, 5000);
+            for (int i = 0; i < numDocs; i++) {
+                iw.addDocument(List.of(new SortedDocValuesField("str_value", new BytesRef(Integer.toString(i)))));
+            }
+            try (IndexReader reader = iw.getReader(); HyperLogLogPlusPlus counts = new HyperLogLogPlusPlus(10, bigArrays, 1)) {
+                for (LeafReaderContext leaf : reader.leaves()) {
+                    final CardinalityAggregator.OrdinalsCollector collector = new CardinalityAggregator.OrdinalsCollector(
+                        counts,
+                        DocValues.getSortedSet(leaf.reader(), "str_value"),
+                        bigArrays
+                    );
+                    try {
+                        longArrays.clear();
+                        collector.postCollect();
+                        assertThat(longArrays, empty());
+                    } finally {
+                        collector.close();
+                    }
+                }
+                assertEquals(0, counts.cardinality(0));
+            }
+        }
+    }
+
+    private static byte[] sketchBytes(HyperLogLogPlusPlus counts, long bucket) throws IOException {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            counts.writeTo(bucket, out);
+            return BytesReference.toBytes(out.bytes());
+        }
     }
 
     private void testAggregation(
