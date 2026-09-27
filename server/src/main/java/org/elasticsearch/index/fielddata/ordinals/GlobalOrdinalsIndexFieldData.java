@@ -15,6 +15,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.util.Accountable;
+import org.elasticsearch.common.CheckedIntFunction;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
@@ -30,7 +31,6 @@ import org.elasticsearch.search.sort.BucketedSort;
 import org.elasticsearch.search.sort.SortOrder;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.Collection;
 
 /**
@@ -162,20 +162,16 @@ public final class GlobalOrdinalsIndexFieldData implements IndexOrdinalsFieldDat
         }
 
         /**
-         * Lazy creation of the {@link TermsEnum} for each segment present in this reader
+         * Lazy creation of the {@link TermsEnum} of a segment of this reader
          */
-        private TermsEnum[] getOrLoadTermsEnums() {
+        private TermsEnum getOrLoadTermsEnum(int segmentIndex) throws IOException {
             if (lookups == null) {
                 lookups = new TermsEnum[segmentAfd.length];
-                for (int i = 0; i < lookups.length; i++) {
-                    try {
-                        lookups[i] = segmentAfd[i].getOrdinalsValues().termsEnum();
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("Failed to load terms enum", e);
-                    }
-                }
             }
-            return lookups;
+            if (lookups[segmentIndex] == null) {
+                lookups[segmentIndex] = segmentAfd[segmentIndex].getOrdinalsValues().termsEnum();
+            }
+            return lookups[segmentIndex];
         }
 
         @Override
@@ -238,7 +234,7 @@ public final class GlobalOrdinalsIndexFieldData implements IndexOrdinalsFieldDat
                         // segment ordinals match global ordinals
                         return values;
                     }
-                    TermsEnum[] atomicLookups = getOrLoadTermsEnums();
+                    CheckedIntFunction<TermsEnum, IOException> atomicLookups = Consumer.this::getOrLoadTermsEnum;
                     SortedSetDocValues singleton = SingletonGlobalOrdinalMapping.singletonIfPossible(
                         ordinalMap,
                         values,

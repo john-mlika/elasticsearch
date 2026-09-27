@@ -14,6 +14,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LongValues;
+import org.elasticsearch.common.CheckedIntFunction;
 
 import java.io.IOException;
 
@@ -26,9 +27,14 @@ final class GlobalOrdinalMapping extends SortedSetDocValues {
     private final SortedSetDocValues values;
     private final OrdinalMap ordinalMap;
     private final LongValues mapping;
-    private final TermsEnum[] lookups;
+    private final CheckedIntFunction<TermsEnum, IOException> lookups;
 
-    GlobalOrdinalMapping(OrdinalMap ordinalMap, SortedSetDocValues values, TermsEnum[] lookups, int segmentIndex) {
+    GlobalOrdinalMapping(
+        OrdinalMap ordinalMap,
+        SortedSetDocValues values,
+        CheckedIntFunction<TermsEnum, IOException> lookups,
+        int segmentIndex
+    ) {
         super();
         this.values = values;
         this.lookups = lookups;
@@ -64,8 +70,9 @@ final class GlobalOrdinalMapping extends SortedSetDocValues {
     public BytesRef lookupOrd(long globalOrd) throws IOException {
         final long segmentOrd = ordinalMap.getFirstSegmentOrd(globalOrd);
         int readerIndex = ordinalMap.getFirstSegmentNumber(globalOrd);
-        lookups[readerIndex].seekExact(segmentOrd);
-        return lookups[readerIndex].term();
+        TermsEnum lookup = lookups.apply(readerIndex);
+        lookup.seekExact(segmentOrd);
+        return lookup.term();
     }
 
     @Override

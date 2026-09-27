@@ -15,6 +15,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LongValues;
+import org.elasticsearch.common.CheckedIntFunction;
 
 import java.io.IOException;
 
@@ -31,7 +32,12 @@ class SingletonGlobalOrdinalMapping extends SortedDocValues {
      * unwrapped or {@code null} if the {@link OrdinalMap} and
      * {@link SortedSetDocValues} aren't compatible with {@link SortedDocValues}.
      */
-    static SortedSetDocValues singletonIfPossible(OrdinalMap ordinalMap, SortedSetDocValues values, TermsEnum[] lookups, int segmentIndex) {
+    static SortedSetDocValues singletonIfPossible(
+        OrdinalMap ordinalMap,
+        SortedSetDocValues values,
+        CheckedIntFunction<TermsEnum, IOException> lookups,
+        int segmentIndex
+    ) {
         /*
          * We can manage a singleton if the total value count
          * fits in an `int` *and* the segment ords are a singleton.
@@ -51,9 +57,14 @@ class SingletonGlobalOrdinalMapping extends SortedDocValues {
     private final SortedDocValues values;
     private final OrdinalMap ordinalMap;
     private final LongValues mapping;
-    private final TermsEnum[] lookups;
+    private final CheckedIntFunction<TermsEnum, IOException> lookups;
 
-    private SingletonGlobalOrdinalMapping(OrdinalMap ordinalMap, SortedDocValues values, TermsEnum[] lookups, int segmentIndex) {
+    private SingletonGlobalOrdinalMapping(
+        OrdinalMap ordinalMap,
+        SortedDocValues values,
+        CheckedIntFunction<TermsEnum, IOException> lookups,
+        int segmentIndex
+    ) {
         this.values = values;
         this.lookups = lookups;
         this.ordinalMap = ordinalMap;
@@ -79,8 +90,9 @@ class SingletonGlobalOrdinalMapping extends SortedDocValues {
     public BytesRef lookupOrd(int globalOrd) throws IOException {
         final long segmentOrd = ordinalMap.getFirstSegmentOrd(globalOrd);
         int readerIndex = ordinalMap.getFirstSegmentNumber(globalOrd);
-        lookups[readerIndex].seekExact(segmentOrd);
-        return lookups[readerIndex].term();
+        TermsEnum lookup = lookups.apply(readerIndex);
+        lookup.seekExact(segmentOrd);
+        return lookup.term();
     }
 
     @Override
