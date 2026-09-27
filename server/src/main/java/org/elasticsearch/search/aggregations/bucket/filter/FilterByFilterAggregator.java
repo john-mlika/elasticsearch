@@ -133,6 +133,15 @@ public class FilterByFilterAggregator extends FiltersAggregator {
         }
 
         /**
+         * Is the rewrite still valid? Once this is {@code false} it stays
+         * {@code false} and {@link #build} will return {@code null}, so
+         * callers can stop building filters to {@link #add}.
+         */
+        public final boolean isValid() {
+            return valid;
+        }
+
+        /**
          * Build the adapter or {@code null} if this isn't a valid rewrite.
          */
         public final T build() throws IOException {

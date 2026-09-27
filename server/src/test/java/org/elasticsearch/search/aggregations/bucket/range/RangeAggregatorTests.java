@@ -14,7 +14,9 @@ import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.NumericUtils;
@@ -33,20 +35,28 @@ import org.elasticsearch.index.mapper.OnScriptError;
 import org.elasticsearch.script.LongFieldScript;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.StringFieldScript;
+import org.elasticsearch.search.DocValueFormat;
 import org.elasticsearch.search.aggregations.Aggregator;
+import org.elasticsearch.search.aggregations.AggregatorFactories;
 import org.elasticsearch.search.aggregations.AggregatorTestCase;
 import org.elasticsearch.search.aggregations.CardinalityUpperBound;
+import org.elasticsearch.search.aggregations.support.AggregationContext;
 import org.elasticsearch.search.aggregations.support.AggregationInspectionHelper;
+import org.elasticsearch.search.aggregations.support.CoreValuesSourceType;
+import org.elasticsearch.search.aggregations.support.ValuesSourceConfig;
 import org.elasticsearch.search.lookup.SearchLookup;
 import org.elasticsearch.search.runtime.StringScriptFieldTermQuery;
 
 import java.io.IOException;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static java.util.Collections.singleton;
@@ -57,6 +67,9 @@ import static org.hamcrest.Matchers.closeTo;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.Mockito.mock;
 
 public class RangeAggregatorTests extends AggregatorTestCase {
 
@@ -676,6 +689,94 @@ public class RangeAggregatorTests extends AggregatorTestCase {
             dummyFt,
             numberFt
         );
+    }
+
+    /**
+     * A top level query that can be merged with each range keeps the filter-by-filter rewrite.
+     */
+    public void testAdaptIntoFiltersWhenTopLevelQueryMerges() throws IOException {
+        adaptIntoFilters(Queries.ALL_DOCS_INSTANCE, null, (adapted, rangesBuilt) -> {
+            assertThat(adapted, notNullValue());
+            assertThat(rangesBuilt, equalTo(3));
+        });
+    }
+
+    /**
+     * A top level query that can't be merged with a range makes the first range invalidate the rewrite,
+     * so we stop there rather than building a query for every range.
+     */
+    public void testAdaptIntoFiltersStopsAtFirstInefficientUnion() throws IOException {
+        adaptIntoFilters(new TermQuery(new Term("other", "x")), null, (adapted, rangesBuilt) -> {
+            assertThat(adapted, nullValue());
+            assertThat(rangesBuilt, equalTo(1));
+        });
+    }
+
+    /**
+     * With a parent the rewrite is invalid from the start, so we don't build a single range query.
+     */
+    public void testAdaptIntoFiltersUnderParent() throws IOException {
+        adaptIntoFilters(Queries.ALL_DOCS_INSTANCE, mock(Aggregator.class), (adapted, rangesBuilt) -> {
+            assertThat(adapted, nullValue());
+            assertThat(rangesBuilt, equalTo(0));
+        });
+    }
+
+    private void adaptIntoFilters(Query topLevelQuery, Aggregator parent, BiConsumer<RangeAggregator.FromFilters<?>, Integer> verify)
+        throws IOException {
+        // Each range the adaptation looks at formats its bounds with the field's doc value format
+        AtomicInteger formats = new AtomicInteger();
+        MappedFieldType numberFt = new NumberFieldMapper.NumberFieldType(NUMBER_FIELD_NAME, NumberType.INTEGER) {
+            @Override
+            public DocValueFormat docValueFormat(String format, ZoneId timeZone) {
+                formats.incrementAndGet();
+                return super.docValueFormat(format, timeZone);
+            }
+        };
+        MappedFieldType otherFt = new KeywordFieldMapper.KeywordFieldType("other", true, true, Collections.emptyMap());
+        RangeAggregator.Range[] ranges = new RangeAggregator.Range[] {
+            new RangeAggregator.Range(null, 0.0, 1.0),
+            new RangeAggregator.Range(null, 1.0, 2.0),
+            new RangeAggregator.Range(null, 2.0, 3.0) };
+        withIndex(iw -> {
+            for (int d = 0; d < 10; d++) {
+                iw.addDocument(
+                    List.of(
+                        new IntPoint(NUMBER_FIELD_NAME, d % 3),
+                        new SortedNumericDocValuesField(NUMBER_FIELD_NAME, d % 3),
+                        new KeywordFieldMapper.KeywordField("other", new BytesRef("x"), KeywordFieldMapper.Defaults.FIELD_TYPE)
+                    )
+                );
+            }
+        }, reader -> {
+            try (AggregationContext context = createAggregationContext(reader, topLevelQuery, numberFt, otherFt)) {
+                ValuesSourceConfig config = ValuesSourceConfig.resolve(
+                    context,
+                    null,
+                    NUMBER_FIELD_NAME,
+                    null,
+                    null,
+                    null,
+                    null,
+                    CoreValuesSourceType.NUMERIC
+                );
+                formats.set(0);
+                RangeAggregator.FromFilters<?> adapted = RangeAggregator.adaptIntoFiltersOrNull(
+                    "r",
+                    AggregatorFactories.EMPTY,
+                    config,
+                    InternalRange.FACTORY,
+                    ranges,
+                    RangeAggregator.DOCS_PER_RANGE_TO_USE_FILTERS,
+                    false,
+                    context,
+                    parent,
+                    CardinalityUpperBound.ONE,
+                    Map.of()
+                );
+                verify.accept(adapted, formats.get());
+            }
+        });
     }
 
     private void testCase(

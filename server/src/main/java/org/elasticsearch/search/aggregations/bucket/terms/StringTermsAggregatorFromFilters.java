@@ -87,10 +87,14 @@ public class StringTermsAggregatorFromFilters extends AdaptingAggregator {
                     );
                 }
             };
+        if (filterByFilterBuilder.isValid() == false) {
+            // Invalid before the first filter, for example under a parent aggregation: don't bother loading the values
+            return null;
+        }
         SortedSetDocValues values = valuesSupplier.get();
         TermsEnum terms = values.termsEnum();
         String field = valuesSourceConfig.fieldContext().field();
-        for (long ord = 0; ord < values.getValueCount(); ord++) {
+        for (long ord = 0; ord < values.getValueCount() && filterByFilterBuilder.isValid(); ord++) {
             if (acceptedOrds.test(ord) == false) {
                 continue;
             }

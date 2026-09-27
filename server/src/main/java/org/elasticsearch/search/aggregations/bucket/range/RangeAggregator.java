@@ -406,7 +406,7 @@ public abstract class RangeAggregator extends BucketsAggregator {
                 );
             }
         };
-        for (int i = 0; i < ranges.length; i++) {
+        for (int i = 0; i < ranges.length && filterByFilterBuilder.isValid(); i++) {
             /*
              * If the bounds on the ranges are too high then the `double`s
              * that we work with will round differently in the native range
