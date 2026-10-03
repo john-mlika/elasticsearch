@@ -40,6 +40,7 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
@@ -59,7 +60,6 @@ import org.elasticsearch.index.codec.vectors.BQVectorUtils;
 import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
 import org.elasticsearch.index.codec.vectors.es816.BinaryQuantizer;
 import org.elasticsearch.search.internal.FilterFloatVectorValues;
-import org.elasticsearch.simdvec.ESVectorUtil;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -414,9 +414,32 @@ public class ES818BinaryQuantizedVectorsReader extends FlatVectorsReader impleme
             }
             throw t;
         }
-        IndexInput quantizedScoreDataInput = segmentWriteState.directory.openInput(tempScoreQuantizedVectorName, segmentWriteState.context);
+        assert docsWithField.cardinality() == fi.size;
+        return mergeScorerSupplier(fieldInfo, segmentWriteState.directory, segmentWriteState.context, tempScoreQuantizedVectorName);
+    }
+
+    /**
+     * Builds a merge scorer that scores the query-side records in {@code queryDataName}, one per vector of the
+     * field in the layout {@link ES818BinaryQuantizedVectorsWriter#writeQueryRecord} writes, against this segment's
+     * index-side records.
+     *
+     * <p>This method takes ownership of the file: the returned supplier deletes it when closed, and this method
+     * deletes it if it returns {@code null} or fails.
+     */
+    CloseableRandomVectorScorerSupplier mergeScorerSupplier(
+        FieldInfo fieldInfo,
+        Directory directory,
+        IOContext context,
+        String queryDataName
+    ) throws IOException {
+        FieldEntry fi = fields.get(fieldInfo.name);
+        if (fi == null) {
+            IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+            return null;
+        }
+        IndexInput queryData = null;
         try {
-            final IndexInput finalBinarizedScoreDataInput = quantizedScoreDataInput;
+            queryData = directory.openInput(queryDataName, context);
             // Read the index vectors from their region within the segment data file (sliced to the field
             // offset), mirroring getQuantizedVectorValues. Using the raw, unsliced input would score the
             // graph against bytes at the wrong file offset.
@@ -424,7 +447,7 @@ public class ES818BinaryQuantizedVectorsReader extends FlatVectorsReader impleme
                 fi.ordToDocDISIReaderConfiguration,
                 fi.dimension,
                 fi.size,
-                quantizer,
+                new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction()),
                 fieldInfo.getVectorSimilarityFunction(),
                 vectorScorer,
                 fi.centroid,
@@ -435,21 +458,23 @@ public class ES818BinaryQuantizedVectorsReader extends FlatVectorsReader impleme
             );
             RandomVectorScorerSupplier scorerSupplier = vectorScorer.getRandomVectorScorerSupplier(
                 fieldInfo.getVectorSimilarityFunction(),
-                new OffHeapBinarizedQueryVectorValues(
-                    finalBinarizedScoreDataInput,
-                    fieldInfo.getVectorDimension(),
-                    docsWithField.cardinality()
-                ),
+                new OffHeapBinarizedQueryVectorValues(queryData, fieldInfo.getVectorDimension(), fi.size),
                 vectorValues
             );
-            final String finalTempScoreQuantizedVectorName = tempScoreQuantizedVectorName;
+            final IndexInput queryDataInput = queryData;
             return new BinarizedCloseableRandomVectorScorerSupplier(scorerSupplier, vectorValues, () -> {
-                IOUtils.close(finalBinarizedScoreDataInput);
-                IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, finalTempScoreQuantizedVectorName);
+                try {
+                    IOUtils.close(queryDataInput);
+                } finally {
+                    IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+                }
             });
         } catch (Throwable t) {
-            IOUtils.closeWhileSuppressingExceptions(t, quantizedScoreDataInput);
-            IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempScoreQuantizedVectorName);
+            try {
+                IOUtils.closeWhileSuppressingExceptions(t, queryData);
+            } finally {
+                IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+            }
             throw t;
         }
     }
@@ -476,14 +501,7 @@ public class ES818BinaryQuantizedVectorsReader extends FlatVectorsReader impleme
                 centroid
             );
             docsWithField.add(docV);
-            // pack and store the 4bit query vector
-            ESVectorUtil.stride4BitValues(quantizationScratch, toQuery);
-            binarizedQueryData.writeBytes(toQuery, toQuery.length);
-            binarizedQueryData.writeInt(Float.floatToIntBits(r.lowerInterval()));
-            binarizedQueryData.writeInt(Float.floatToIntBits(r.upperInterval()));
-            binarizedQueryData.writeInt(Float.floatToIntBits(r.additionalCorrection()));
-            assert r.quantizedComponentSum() >= 0 && r.quantizedComponentSum() <= 0xffff;
-            binarizedQueryData.writeShort((short) r.quantizedComponentSum());
+            ES818BinaryQuantizedVectorsWriter.writeQueryRecord(binarizedQueryData, quantizationScratch, toQuery, r);
         }
         return docsWithField;
     }

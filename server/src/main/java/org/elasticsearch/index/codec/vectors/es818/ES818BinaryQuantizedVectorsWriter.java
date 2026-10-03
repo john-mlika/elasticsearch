@@ -23,6 +23,7 @@ import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatFieldVectorsWriter;
+import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
@@ -39,12 +40,19 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.FloatArrayList;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.VectorUtil;
+import org.apache.lucene.util.hnsw.CloseableRandomVectorScorerSupplier;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.index.codec.vectors.BQVectorUtils;
 import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
+import org.elasticsearch.index.codec.vectors.es816.BinaryQuantizer;
 import org.elasticsearch.simdvec.ESVectorUtil;
 
 import java.io.IOException;
@@ -53,6 +61,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.IntPredicate;
 
 import static org.apache.lucene.index.VectorSimilarityFunction.COSINE;
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
@@ -314,6 +323,17 @@ public class ES818BinaryQuantizedVectorsWriter extends FlatVectorsWriter {
 
     @Override
     public void mergeOneFlatVectorField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+        mergeOneFlatVectorField(fieldInfo, mergeState, vectorCount -> false);
+    }
+
+    @Override
+    public MergeScorerData mergeOneFlatVectorFieldForMergeScorer(FieldInfo fieldInfo, MergeState mergeState, IntPredicate needsMergeScorer)
+        throws IOException {
+        return mergeOneFlatVectorField(fieldInfo, mergeState, needsMergeScorer);
+    }
+
+    private MergeScorerData mergeOneFlatVectorField(FieldInfo fieldInfo, MergeState mergeState, IntPredicate needsMergeScorer)
+        throws IOException {
         rawVectorDelegate.mergeOneField(fieldInfo, mergeState);
         if (fieldInfo.getVectorEncoding().equals(VectorEncoding.FLOAT32)) {
             final float[] centroid;
@@ -328,24 +348,141 @@ public class ES818BinaryQuantizedVectorsWriter extends FlatVectorsWriter {
             if (fieldInfo.getVectorSimilarityFunction() == COSINE) {
                 floatVectorValues = new NormalizedFloatVectorValues(floatVectorValues);
             }
-            BinarizedFloatVectorValues binarizedVectorValues = new BinarizedFloatVectorValues(
-                floatVectorValues,
-                new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction()),
-                centroid
-            );
+            OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction());
             long vectorDataOffset = binarizedVectorData.alignFilePointer(Float.BYTES);
-            DocsWithFieldSet docsWithField = writeBinarizedVectorData(binarizedVectorData, binarizedVectorValues);
-            long vectorDataLength = binarizedVectorData.getFilePointer() - vectorDataOffset;
-            float centroidDp = docsWithField.cardinality() > 0 ? ESVectorUtil.dotProduct(centroid, centroid) : 0;
-            writeMeta(
-                fieldInfo,
-                segmentWriteState.segmentInfo.maxDoc(),
-                vectorDataOffset,
-                vectorDataLength,
-                centroid,
-                centroidDp,
-                docsWithField
-            );
+            DocsWithFieldSet docsWithField;
+            MergeScorerData mergeScorerData = null;
+            // The predicate sees vectorCount before deletions, so it can request data even when the merged field
+            // is too small to build a graph.
+            if (needsMergeScorer.test(vectorCount)) {
+                docsWithField = new DocsWithFieldSet();
+                mergeScorerData = writeBinarizedVectorAndQueryData(fieldInfo, floatVectorValues, quantizer, centroid, docsWithField);
+            } else {
+                docsWithField = writeBinarizedVectorData(
+                    binarizedVectorData,
+                    new BinarizedFloatVectorValues(floatVectorValues, quantizer, centroid)
+                );
+            }
+            try {
+                long vectorDataLength = binarizedVectorData.getFilePointer() - vectorDataOffset;
+                float centroidDp = docsWithField.cardinality() > 0 ? ESVectorUtil.dotProduct(centroid, centroid) : 0;
+                writeMeta(
+                    fieldInfo,
+                    segmentWriteState.segmentInfo.maxDoc(),
+                    vectorDataOffset,
+                    vectorDataLength,
+                    centroid,
+                    centroidDp,
+                    docsWithField
+                );
+                return mergeScorerData;
+            } catch (Throwable t) {
+                // The handle was never returned, so nobody else can release its records.
+                IOUtils.closeWhileSuppressingExceptions(t, mergeScorerData);
+                throw t;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Writes the merged vectors' 1-bit index-side records and, in the same pass, their 4-bit query-side records to
+     * a temporary file owned by the returned handle. {@link OptimizedScalarQuantizer#multiScalarQuantize} centers
+     * each vector once and quantizes it at both bit widths.
+     *
+     * @param docsWithField filled with the documents that were written
+     */
+    private MergeScorerData writeBinarizedVectorAndQueryData(
+        FieldInfo fieldInfo,
+        FloatVectorValues floatVectorValues,
+        OptimizedScalarQuantizer quantizer,
+        float[] centroid,
+        DocsWithFieldSet docsWithField
+    ) throws IOException {
+        int dimension = floatVectorValues.dimension();
+        int discretizedDims = BQVectorUtils.discretize(dimension, 64);
+        float[] scratch = new float[dimension];
+        int[] indexQuantized = new int[dimension];
+        int[] queryQuantized = new int[dimension];
+        byte[] indexPacked = new byte[discretizedDims / 8];
+        byte[] queryPacked = new byte[(discretizedDims / 8) * BinaryQuantizer.B_QUERY];
+        int[][] destinations = new int[][] { indexQuantized, queryQuantized };
+        byte[] bits = new byte[] { 1, BinaryQuantizer.B_QUERY };
+        Directory directory = segmentWriteState.directory;
+        String queryDataName = null;
+        try (IndexOutput queryData = directory.createTempOutput(segmentWriteState.segmentInfo.name, "queries", queryDataContext())) {
+            queryDataName = queryData.getName();
+            KnnVectorValues.DocIndexIterator iterator = floatVectorValues.iterator();
+            for (int docV = iterator.nextDoc(); docV != NO_MORE_DOCS; docV = iterator.nextDoc()) {
+                OptimizedScalarQuantizer.QuantizationResult[] corrections = quantizer.multiScalarQuantize(
+                    floatVectorValues.vectorValue(iterator.index()),
+                    scratch,
+                    destinations,
+                    bits,
+                    centroid
+                );
+                // the index side, packed as BinarizedFloatVectorValues packs it
+                ESVectorUtil.pack1BitValues(indexQuantized, indexPacked);
+                binarizedVectorData.writeBytes(indexPacked, indexPacked.length);
+                writeCorrectiveTerms(binarizedVectorData, corrections[0]);
+                writeQueryRecord(queryData, queryQuantized, queryPacked, corrections[1]);
+                docsWithField.add(docV);
+            }
+            CodecUtil.writeFooter(queryData);
+        } catch (Throwable t) {
+            if (queryDataName != null) {
+                IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+            }
+            throw t;
+        }
+        return new PreparedQueryData(directory, queryDataContext(), fieldInfo, queryDataName);
+    }
+
+    /**
+     * The quantized query vectors staged for the merge scorer. A graph build reads them by ordinal as it walks, so
+     * they are read at random.
+     */
+    private IOContext queryDataContext() {
+        return segmentWriteState.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM);
+    }
+
+    /** Owns one field's temporary query-side records until its graph scorer takes them over. */
+    @SuppressForbidden(reason = "Lucene classes")
+    private static final class PreparedQueryData implements MergeScorerData {
+        private final Directory directory;
+        private final IOContext context;
+        private final FieldInfo fieldInfo;
+        private final String fileName;
+        private boolean spent;
+
+        PreparedQueryData(Directory directory, IOContext context, FieldInfo fieldInfo, String fileName) {
+            this.directory = directory;
+            this.context = context;
+            this.fieldInfo = fieldInfo;
+            this.fileName = fileName;
+        }
+
+        @Override
+        public CloseableRandomVectorScorerSupplier scorerSupplier(FlatVectorsReader mergedReader) throws IOException {
+            if (spent) {
+                throw new IllegalStateException("already consumed or closed: " + fileName);
+            }
+            spent = true;
+            if (mergedReader instanceof ES818BinaryQuantizedVectorsReader reader) {
+                // the reader takes the file over, whatever it returns
+                return reader.mergeScorerSupplier(fieldInfo, directory, context, fileName);
+            }
+            // not this format's reader
+            IOUtils.deleteFilesIgnoringExceptions(directory, fileName);
+            return null;
+        }
+
+        @Override
+        public void close() {
+            if (spent == false) {
+                spent = true;
+                IOUtils.deleteFilesIgnoringExceptions(directory, fileName);
+            }
         }
     }
 
@@ -366,6 +503,30 @@ public class ES818BinaryQuantizedVectorsWriter extends FlatVectorsWriter {
             docsWithField.add(docV);
         }
         return docsWithField;
+    }
+
+    /**
+     * Packs a 4-bit query-side record and writes it with its corrective terms. The writer and the reader produce
+     * query-side records through this method.
+     */
+    static void writeQueryRecord(
+        IndexOutput output,
+        int[] quantized,
+        byte[] packed,
+        OptimizedScalarQuantizer.QuantizationResult corrections
+    ) throws IOException {
+        ESVectorUtil.stride4BitValues(quantized, packed);
+        output.writeBytes(packed, packed.length);
+        writeCorrectiveTerms(output, corrections);
+    }
+
+    private static void writeCorrectiveTerms(IndexOutput output, OptimizedScalarQuantizer.QuantizationResult corrections)
+        throws IOException {
+        output.writeInt(Float.floatToIntBits(corrections.lowerInterval()));
+        output.writeInt(Float.floatToIntBits(corrections.upperInterval()));
+        output.writeInt(Float.floatToIntBits(corrections.additionalCorrection()));
+        assert corrections.quantizedComponentSum() >= 0 && corrections.quantizedComponentSum() <= 0xffff;
+        output.writeShort((short) corrections.quantizedComponentSum());
     }
 
     @Override
