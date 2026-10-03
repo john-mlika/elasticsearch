@@ -501,6 +501,7 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         private ExitableByteVectorValues(ByteVectorValues in, QueryCancellation queryCancellation) {
             super(in);
             this.queryCancellation = queryCancellation;
+            this.queryCancellation.checkCancelled();
         }
 
         @Override
@@ -558,16 +559,13 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         }
 
         @Override
-        public DocIndexIterator iterator() {
-            return createExitableIterator(in.iterator(), queryCancellation);
-        }
-
-        @Override
         public ByteVectorValues copy() throws IOException {
             return new ExitableByteVectorValues(in.copy(), queryCancellation);
         }
     }
 
+    // Vector values check for cancellation once, when a segment's values are pulled. Their doc ID iterator is not wrapped: a filtered
+    // kNN search intersects it with the filter doc by doc to build the accepted docs, where a wrapper would add a call per doc.
     private static ByteVectorValues wrapIfNeeded(ByteVectorValues vectorValues, QueryCancellation queryCancellation) {
         if (queryCancellation.isEnabled()) {
             return new ExitableByteVectorValues(vectorValues, queryCancellation);
@@ -645,11 +643,6 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
                     return iterator;
                 }
             };
-        }
-
-        @Override
-        public DocIndexIterator iterator() {
-            return createExitableIterator(in.iterator(), queryCancellation);
         }
 
         @Override
